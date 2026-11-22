@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Værelsesfordeling</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="container">
+    <header class="topbar">
+      <div>
+        <h1>🏡 Værelsesfordeling</h1>
+        <p class="subtitle">Administrer første fordeling og efterfølgende værelsesskift med fuld historik.</p>
+      </div>
+      <div class="topbar-actions">
+        <button id="toggle-settings" class="btn btn-secondary">⚙️ Indstillinger &amp; Kolonner</button>
+      </div>
+    </header>
+
+    <!-- Periode- & Værelsesskift-vælger -->
+    <nav id="periods-bar" class="periods-bar" aria-label="Perioder og værelsesskift"></nav>
+
+    <!-- Indstillinger & Kolonne-mapping (gemmes i localStorage) -->
+    <section id="settings-panel" class="card hidden">
+      <h2>Indstillinger &amp; Kolonne-mapping</h2>
+      <p class="hint">Værelseslisten og kolonne-opsætningen gælder på tværs af alle perioder. Elevlisten gemmes per periode/værelsesskift.</p>
+
+      <div class="form-group" style="margin-bottom: 1.25rem;">
+        <label for="url-vaerelser">Fælles Værelsesliste (CSV-link)</label>
+        <input type="url" id="url-vaerelser" placeholder="https://docs.google.com/..." />
+      </div>
+
+      <div class="period-settings-box">
+        <div class="period-settings-header">
+          <h3 id="active-period-settings-title">Opsætning for aktiv periode</h3>
+          <button type="button" id="btn-delete-period" class="btn btn-danger-outline btn-sm">🗑️ Slet dette værelsesskift</button>
+        </div>
+        <div class="grid-2" style="margin-bottom: 0;">
+          <div class="form-group">
+            <label for="period-name-input">Navn på periode / værelsesskift</label>
+            <input type="text" id="period-name-input" placeholder="F.eks. Periode 1 eller Værelsesskift 1" />
+          </div>
+          <div class="form-group">
+            <label for="url-period-elever">Elevliste for denne periode (CSV-link)</label>
+            <input type="url" id="url-period-elever" placeholder="https://docs.google.com/..." />
+          </div>
+        </div>
+      </div>
+
+      <div class="rules-bar">
+        <label class="checkbox-label">
+          <input type="checkbox" id="rule-ab-strict-internat" />
+          <span>Fravalg af internationale gælder også delt bad (A/B-værelser)</span>
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="rule-ab-strict-exclude" checked />
+          <span>"Ikke med"-personer må heller ikke dele bad (A/B-værelser)</span>
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="rule-avoid-two-new" checked />
+          <span>Undgå så vidt muligt at sætte to nye elever på samme værelse</span>
+        </label>
+      </div>
+
+      <div id="mapping-container" class="mapping-grid"></div>
+
+      <div class="settings-footer">
+        <button id="btn-save-settings" class="btn btn-primary">Gem indstillinger &amp; opdater visning</button>
+        <button id="btn-reset-storage" class="btn btn-danger-outline">Nulstil alt gemt data</button>
+      </div>
+    </section>
+
+    <!-- Handlingslinje -->
+    <section class="action-bar">
+      <div class="action-group">
+        <button id="btn-fetch" class="btn btn-secondary">🔄 Hent data fra ark</button>
+        <button id="btn-allocate" class="btn btn-primary">🎲 Fordel ulåste</button>
+        <button id="btn-clear-unlocked" class="btn btn-danger-outline">🧹 Ryd ulåste</button>
+      </div>
+      <div class="action-group">
+        <button id="btn-copy-tsv" class="btn btn-outline">📋 Kopiér til Google Sheets</button>
+        <button id="btn-export-csv" class="btn btn-outline">⬇️ Download CSV</button>
+      </div>
+    </section>
+
+    <div id="status-bar" class="status-bar"></div>
+    <div id="warnings-box" class="warnings-box hidden"></div>
+
+    <!-- Optælling af sengepladser og elever -->
+    <section id="stats-bar" class="stats-grid"></section>
+
+    <!-- Status på værelsesskift (vises kun på værelsesskift-faner) -->
+    <section id="shift-status-panel" class="card shift-status-card hidden"></section>
+
+    <!-- Pulje med elever uden værelse -->
+    <section id="unplaced-dropzone" class="card unplaced-panel">
+      <div class="unplaced-header">
+        <div>
+          <h2>👤 Elever uden værelse (<span id="unplaced-count-badge">0</span>)</h2>
+          <p class="hint" style="margin:0;">Træk en elev ned på et værelse, klik på en ledig sengeplads, eller træk en elev herop for at fjerne dem fra et værelse.</p>
+        </div>
+      </div>
+      <div id="unplaced-list" class="unplaced-chips"></div>
+    </section>
+
+    <!-- Værelseskort -->
+    <section>
+      <div class="section-header">
+        <h2 id="rooms-section-title">Værelsesoversigt</h2>
+        <div class="legend">
+          <span class="badge badge-locked">🔒 Låst (klik for at låse op)</span>
+          <span class="badge badge-random">🎲 Fordelt (klik for at låse)</span>
+          <span class="badge badge-intl">🌍 International</span>
+          <span class="badge badge-new">✨ Ny elev</span>
+        </div>
+      </div>
+      <div id="rooms-grid" class="rooms-grid"></div>
+    </section>
+
+    <!-- Tabeloversigt til hurtig copy-paste / print -->
+    <section class="card table-section">
+      <h2>Samlet liste (klar til udskrift eller ark)</h2>
+      <div id="summary-table-container"></div>
+    </section>
+  </div>
+
+  <!-- Modal til valg af elev ved klik på sengeplads -->
+  <div id="bed-picker-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h3 id="picker-title">Vælg elev til værelse</h3>
+          <div id="picker-subtitle" class="room-meta"></div>
+        </div>
+        <button id="btn-close-picker" class="btn-icon" title="Luk">✕</button>
+      </div>
+      <div class="picker-search-wrap">
+        <input type="text" id="picker-search" placeholder="Søg på navn, køn eller nationalitet..." autocomplete="off" />
+      </div>
+      <div id="picker-list" class="picker-list"></div>
+    </div>
+  </div>
+
+  <!-- Modal til oprettelse af nyt værelsesskift -->
+  <div id="new-period-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h3>Opret nyt værelsesskift</h3>
+          <div class="room-meta">Tidligere perioder gemmes, så du altid kan skifte tilbage og se dem.</div>
+        </div>
+        <button id="btn-close-new-period" class="btn-icon" title="Luk">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group" style="margin-bottom: 0.9rem;">
+          <label for="new-period-name">Navn på værelsesskift</label>
+          <input type="text" id="new-period-name" placeholder="F.eks. Værelsesskift 1" />
+        </div>
+        <div class="form-group" style="margin-bottom: 1.1rem;">
+          <label for="new-period-elever-url">CSV-link til den nye elevliste *</label>
+          <input type="url" id="new-period-elever-url" placeholder="https://docs.google.com/..." />
+          <p class="hint" style="margin: 0.3rem 0 0; font-size: 0.8rem;">Indsæt linket til den friske systemeksport (eller behold samme link, hvis du har overskrevet arket). Nye elever opdages automatisk.</p>
+        </div>
+        <div style="display:flex; justify-content:flex-end; gap:0.5rem;">
+          <button type="button" id="btn-cancel-new-period" class="btn btn-outline">Annuller</button>
+          <button type="button" id="btn-confirm-new-period" class="btn btn-primary">Opret &amp; hent elevliste</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="settings.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
