@@ -11,38 +11,42 @@
     <header class="topbar">
       <div>
         <h1>🏡 Værelsesfordeling</h1>
-        <p class="subtitle">Administrer første fordeling og efterfølgende værelsesskift med fuld historik.</p>
+        <p class="subtitle">Administrer skolens værelsesskift og rejsefordelinger med fuld historik.</p>
       </div>
       <div class="topbar-actions">
         <button id="toggle-settings" class="btn btn-secondary">⚙️ Indstillinger &amp; Kolonner</button>
       </div>
     </header>
 
-    <!-- Periode- & Værelsesskift-vælger -->
-    <nav id="periods-bar" class="periods-bar" aria-label="Perioder og værelsesskift"></nav>
+    <!-- Periode-, Værelsesskift- & Rejse-vælger -->
+    <nav id="periods-bar" class="periods-bar" aria-label="Perioder, værelsesskift og rejser"></nav>
 
     <!-- Indstillinger & Kolonne-mapping (gemmes i localStorage) -->
     <section id="settings-panel" class="card hidden">
       <h2>Indstillinger &amp; Kolonne-mapping</h2>
-      <p class="hint">Værelseslisten og kolonne-opsætningen gælder på tværs af alle perioder. Elevlisten gemmes per periode/værelsesskift.</p>
+      <p class="hint">Skolens værelsesliste og kolonne-opsætningen gælder for alle almindelige perioder. Rejser har deres egen værelsesliste.</p>
 
       <div class="form-group" style="margin-bottom: 1.25rem;">
-        <label for="url-vaerelser">Fælles Værelsesliste (CSV-link)</label>
+        <label for="url-vaerelser">Skolens Fælles Værelsesliste (CSV-link til værelsesskift)</label>
         <input type="url" id="url-vaerelser" placeholder="https://docs.google.com/..." />
       </div>
 
       <div class="period-settings-box">
         <div class="period-settings-header">
           <h3 id="active-period-settings-title">Opsætning for aktiv periode</h3>
-          <button type="button" id="btn-delete-period" class="btn btn-danger-outline btn-sm">🗑️ Slet dette værelsesskift</button>
+          <button type="button" id="btn-delete-period" class="btn btn-danger-outline btn-sm">🗑️ Slet denne fane</button>
         </div>
         <div class="grid-2" style="margin-bottom: 0;">
           <div class="form-group">
-            <label for="period-name-input">Navn på periode / værelsesskift</label>
-            <input type="text" id="period-name-input" placeholder="F.eks. Periode 1 eller Værelsesskift 1" />
+            <label id="period-name-label" for="period-name-input">Navn på periode / værelsesskift</label>
+            <input type="text" id="period-name-input" placeholder="F.eks. Periode 1, Værelsesskift 1 eller La Santa" />
+          </div>
+          <div id="trip-room-url-group" class="form-group hidden">
+            <label for="url-period-vaerelser">Rejsens Værelsesliste (CSV-link)</label>
+            <input type="url" id="url-period-vaerelser" placeholder="https://docs.google.com/..." />
           </div>
           <div class="form-group">
-            <label for="url-period-elever">Elevliste for denne periode (CSV-link)</label>
+            <label id="period-elever-label" for="url-period-elever">Elevliste for denne periode (CSV-link)</label>
             <input type="url" id="url-period-elever" placeholder="https://docs.google.com/..." />
           </div>
         </div>
@@ -90,7 +94,7 @@
     <!-- Optælling af sengepladser og elever -->
     <section id="stats-bar" class="stats-grid"></section>
 
-    <!-- Status på værelsesskift (vises kun på værelsesskift-faner) -->
+    <!-- Status på værelsesskift / rejse (vises på værelsesskift- og rejsefaner) -->
     <section id="shift-status-panel" class="card shift-status-card hidden"></section>
 
     <!-- Pulje med elever uden værelse -->
@@ -142,29 +146,48 @@
     </div>
   </div>
 
-  <!-- Modal til oprettelse af nyt værelsesskift -->
+  <!-- Modal til oprettelse af nyt værelsesskift eller rejse -->
   <div id="new-period-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="modal-card">
       <div class="modal-header">
         <div>
-          <h3>Opret nyt værelsesskift</h3>
+          <h3>Opret nyt værelsesskift eller rejse</h3>
           <div class="room-meta">Tidligere perioder gemmes, så du altid kan skifte tilbage og se dem.</div>
         </div>
         <button id="btn-close-new-period" class="btn-icon" title="Luk">✕</button>
       </div>
       <div class="modal-body">
+        <div class="period-type-selector" role="radiogroup" aria-label="Vælg type">
+          <label class="type-option">
+            <input type="radio" name="new-period-type" value="school" checked />
+            <span>🏡 Værelsesskift (skolen)</span>
+          </label>
+          <label class="type-option">
+            <input type="radio" name="new-period-type" value="trip" />
+            <span>✈️ Rejse (eget værelsesark)</span>
+          </label>
+        </div>
+
         <div class="form-group" style="margin-bottom: 0.9rem;">
-          <label for="new-period-name">Navn på værelsesskift</label>
+          <label id="new-period-name-label" for="new-period-name">Navn på værelsesskift</label>
           <input type="text" id="new-period-name" placeholder="F.eks. Værelsesskift 1" />
         </div>
-        <div class="form-group" style="margin-bottom: 1.1rem;">
-          <label for="new-period-elever-url">CSV-link til den nye elevliste *</label>
-          <input type="url" id="new-period-elever-url" placeholder="https://docs.google.com/..." />
-          <p class="hint" style="margin: 0.3rem 0 0; font-size: 0.8rem;">Indsæt linket til den friske systemeksport (eller behold samme link, hvis du har overskrevet arket). Nye elever opdages automatisk.</p>
+
+        <div id="new-period-rooms-url-group" class="form-group hidden" style="margin-bottom: 0.9rem;">
+          <label for="new-period-rooms-url">CSV-link til rejsens værelsesliste *</label>
+          <input type="url" id="new-period-rooms-url" placeholder="https://docs.google.com/..." />
+          <p class="hint" style="margin: 0.3rem 0 0; font-size: 0.8rem;">Samme kolonneformat som skolens værelsesliste (Værelse, Pladser osv.).</p>
         </div>
+
+        <div class="form-group" style="margin-bottom: 1.1rem;">
+          <label id="new-period-elever-label" for="new-period-elever-url">CSV-link til den nye elevliste *</label>
+          <input type="url" id="new-period-elever-url" placeholder="https://docs.google.com/..." />
+          <p id="new-period-elever-hint" class="hint" style="margin: 0.3rem 0 0; font-size: 0.8rem;">Indsæt linket til den friske systemeksport (eller behold samme link, hvis du har overskrevet arket). Nye elever opdages automatisk.</p>
+        </div>
+
         <div style="display:flex; justify-content:flex-end; gap:0.5rem;">
           <button type="button" id="btn-cancel-new-period" class="btn btn-outline">Annuller</button>
-          <button type="button" id="btn-confirm-new-period" class="btn btn-primary">Opret &amp; hent elevliste</button>
+          <button type="button" id="btn-confirm-new-period" class="btn btn-primary">Opret &amp; hent data</button>
         </div>
       </div>
     </div>

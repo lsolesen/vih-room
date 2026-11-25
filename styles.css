@@ -53,7 +53,7 @@ h2 { margin-top: 0; font-size: 1.2rem; }
 
 .hidden { display: none !important; }
 
-/* Periode- / Værelsesskift-bjælke */
+/* Periode- / Værelsesskift- / Rejse-bjælke */
 .periods-bar {
   display: flex;
   align-items: center;
@@ -87,9 +87,20 @@ h2 { margin-top: 0; font-size: 1.2rem; }
   border-color: #bfdbfe;
 }
 
+.period-tab.is-trip {
+  border-color: #bae6fd;
+  background: #f0f9ff;
+}
+
 .period-tab.active {
   background: var(--primary);
   border-color: var(--primary);
+  color: white;
+}
+
+.period-tab.is-trip.active {
+  background: #0284c7;
+  border-color: #0284c7;
   color: white;
 }
 
@@ -124,6 +135,40 @@ h2 { margin-top: 0; font-size: 1.2rem; }
 .period-add-btn:hover {
   background: #dbeafe;
   border-color: var(--primary);
+}
+
+/* Type-vælger i modal */
+.period-type-selector {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.type-option {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f8fafc;
+  font-size: 0.86rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.type-option:has(input:checked) {
+  border-color: var(--primary);
+  background: #eff6ff;
+  color: #1e3a8a;
+}
+
+.type-option input {
+  margin: 0;
+  accent-color: var(--primary);
 }
 
 /* Knapper */
@@ -187,7 +232,7 @@ h2 { margin-top: 0; font-size: 1.2rem; }
 /* Formularer & Settings */
 .grid-2 {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 1rem;
   margin-bottom: 1rem;
 }
@@ -359,7 +404,7 @@ input[type="url"], input[type="text"], select {
   font-weight: 600;
 }
 
-/* Statuspanel for værelsesskift */
+/* Statuspanel for værelsesskift og rejser */
 .shift-status-card {
   padding: 1.15rem 1.35rem;
   border-left: 4px solid #8b5cf6;
@@ -381,7 +426,7 @@ input[type="url"], input[type="text"], select {
 
 .shift-metrics-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
   gap: 0.85rem;
 }
 
@@ -562,8 +607,16 @@ input[type="url"], input[type="text"], select {
   transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
 }
 
+.room-card.has-conflict,
+.cluster-room-col.has-conflict {
+  border: 2px solid #ea580c;
+  background: #fffaf5;
+}
+
 .room-card.over-capacity,
-.cluster-room-col.over-capacity {
+.cluster-room-col.over-capacity,
+.room-card.over-capacity.has-conflict,
+.cluster-room-col.over-capacity.has-conflict {
   border: 2px solid var(--danger);
   background: #fffafa;
 }
@@ -589,6 +642,18 @@ body.is-dragging .unplaced-panel > * {
   padding: 0.4rem 0.6rem;
   border-radius: 6px;
   margin-bottom: 0.65rem;
+}
+
+.conflict-banner {
+  background: #ffedd5;
+  border: 1px solid #fdba74;
+  color: #9a3412;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 0.4rem 0.6rem;
+  border-radius: 6px;
+  margin-bottom: 0.65rem;
+  line-height: 1.35;
 }
 
 .room-header {
@@ -658,6 +723,11 @@ body.is-dragging .unplaced-panel > * {
   border-color: #bfdbfe;
 }
 
+.student-item.student-conflict {
+  background: #fff7ed;
+  border-color: #fb923c;
+}
+
 .student-item.empty-bed {
   background: transparent;
   border: 1px dashed #cbd5e1;
@@ -703,6 +773,7 @@ button.badge:hover {
 .badge-intl { background: #fef3c7; color: #92400e; }
 .badge-new { background: #f3e8ff; color: #6b21a8; }
 .badge-danger { background: #fee2e2; color: #991b1b; }
+.badge-conflict { background: #ffedd5; color: #9a3412; }
 .badge-dreng { background: #e0f2fe; color: #0369a1; }
 .badge-pige { background: #fce7f3; color: #be185d; }
 .badge-nonbinaer { background: #ccfbf1; color: #0f766e; }
@@ -808,39 +879,4 @@ th { background: #f8fafc; font-weight: 600; }
   body { background: white; padding: 0; }
   .topbar-actions, .periods-bar, .action-bar, #settings-panel, .status-bar, #unplaced-dropzone, .btn-icon { display: none !important; }
   .room-card { break-inside: avoid; box-shadow: none; }
-}
-
-/* Markering af regel- og kønskonflikter på værelser */
-.room-card.has-conflict,
-.cluster-room-col.has-conflict {
-  border: 2px solid #ea580c;
-  background: #fffaf5;
-}
-
-.room-card.over-capacity.has-conflict,
-.cluster-room-col.over-capacity.has-conflict {
-  border: 2px solid var(--danger);
-  background: #fffafa;
-}
-
-.conflict-banner {
-  background: #ffedd5;
-  border: 1px solid #fdba74;
-  color: #9a3412;
-  font-size: 0.8rem;
-  font-weight: 600;
-  padding: 0.4rem 0.6rem;
-  border-radius: 6px;
-  margin-bottom: 0.65rem;
-  line-height: 1.35;
-}
-
-.student-item.student-conflict {
-  background: #fff7ed;
-  border-color: #fb923c;
-}
-
-.badge-conflict {
-  background: #ffedd5;
-  color: #9a3412;
 }

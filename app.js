@@ -99,7 +99,6 @@
     return String(str || "").toLowerCase().replace(/\s+/g, " ").trim();
   }
 
-  // Læser kommaseparerede (eller semikolonseparerede) værdier i det rene dataformat
   function splitList(val) {
     if (!val) return [];
     return String(val)
@@ -166,8 +165,32 @@
     return (s1.international && s2.optOutInternational) || (s2.international && s1.optOutInternational);
   }
 
+  function mapRawRooms(rawRows, mV) {
+    return (rawRows || [])
+      .map((raw, idx) => {
+        const roomId = String(raw[mV.roomId] || "").trim();
+        const capacity = parseInt(raw[mV.capacity], 10);
+        const activeVal = mV.active ? raw[mV.active] : "";
+        const isActive = !isFalsy(activeVal);
+
+        if (!roomId || isNaN(capacity) || capacity <= 0 || !isActive) return null;
+
+        return {
+          roomId,
+          baseId: getBaseRoomId(roomId),
+          floor: getFloorFromRoomId(roomId),
+          capacity,
+          roomType: mV.roomType ? (raw[mV.roomType] || "").trim() : "",
+          priority: mV.priority ? parsePriority(raw[mV.priority]) : 2,
+          fixedGender: mV.gender ? normalizeGender(raw[mV.gender]) : "Fri",
+          index: idx
+        };
+      })
+      .filter(Boolean);
+  }
+
   // Find alle aktive konflikter på værelser og delte bad-grupper (til live-markering)
-  function analyzeRoomConflicts(rooms, assignments, studentMap, rules) {
+  function analyzeRoomConflicts(rooms, assignments, studentMap, rules, isTrip = false) {
     const roomConflicts = new Map();
     const clusterConflicts = new Map();
     const conflictingStudentKeys = new Set();
@@ -194,11 +217,14 @@
 
       // 1. Tjek konflikter inde på hvert enkelt værelse
       clusterRooms.forEach(room => {
-        const occs = (assignments[room.roomId] || [])
-          .map(e => studentMap.get(e.studentKey))
-          .filter(Boolean);
+        const rawEntries = (assignments[room.roomId] || []).filter(e => studentMap.has(e.studentKey));
+        const occs = rawEntries.map(e => studentMap.get(e.studentKey));
+        const allLockedInRoom = rawEntries.length > 0 && rawEntries.every(e => e.locked);
 
-        occs.forEach(s => clusterEntries.push({ room, student: s }));
+        rawEntries.forEach(e => {
+          const s = studentMap.get(e.studentKey);
+          if (s) clusterEntries.push({ room, student: s, locked: !!e.locked });
+        });
 
         if (room.fixedGender !== "Fri") {
           occs.forEach(s => {
@@ -212,8 +238,10 @@
           });
         }
 
+        // På rejser tillades blandede køn, når alle i værelset er forhåndslåst (f.eks. familielejlighed)
+        const skipMixedGenderCheck = isTrip && allLockedInRoom;
         const roomGenders = [...new Set(occs.map(s => s.gender).filter(g => g !== "Fri"))];
-        if (roomGenders.length > 1) {
+        if (!skipMixedGenderCheck && roomGenders.length > 1) {
           occs.forEach(s => {
             if (s.gender !== "Fri") conflictingStudentKeys.add(s.key);
           });
@@ -250,13 +278,14 @@
       // 2. Tjek konflikter på tværs af A/B-værelser med delt bad & toilet
       if (clusterRooms.length > 1 && clusterEntries.length > 0) {
         const clusterLabel = clusterRooms.map(r => r.roomId).join(" & ");
+        const allLockedInCluster = clusterEntries.every(x => x.locked);
         const clusterGenders = [...new Set(clusterEntries.map(x => x.student.gender).filter(g => g !== "Fri"))];
         const hasSingleRoomGenderMix = clusterRooms.some(r => {
           const msgs = roomConflicts.get(r.roomId) || [];
           return msgs.some(m => m.startsWith("Blandede køn"));
         });
 
-        if (clusterGenders.length > 1 && !hasSingleRoomGenderMix) {
+        if (!(isTrip && allLockedInCluster) && clusterGenders.length > 1 && !hasSingleRoomGenderMix) {
           clusterEntries.forEach(x => {
             if (x.student.gender !== "Fri") conflictingStudentKeys.add(x.student.key);
           });
@@ -301,32 +330,60 @@
     return { roomConflicts, clusterConflicts, conflictingStudentKeys, topWarnings };
   }
 
-  // Byg samlet historik fra alle tidligere perioder (0 .. activeIndex - 1)
-  function buildMultiPeriodHistory(state, activePeriodIndex, roomByLower, mE) {
+  // Byg samlet historik:
+  // - Roomies samles på tværs af ALLE tidligere perioder (både skoleperioder og rejser)
+  // - Fysiske værelser, etager og værelsestyper samles KUN fra tidligere SKOLE-perioder
+  // - Elevprofiler (Ikke_Med, international osv.) nedarves fra seneste skoleperiode til rejser
+  function buildMultiPeriodHistory(state, activePeriodIndex, schoolRoomByLower, mE, mV) {
     const priorPeriods = state.periods.slice(0, activePeriodIndex);
-    const knownIds = new Set();
-    const knownNames = new Set();
+    const priorSchoolPeriods = priorPeriods.filter(p => p.type !== "trip");
+    const lastSchoolPeriodIndex = priorPeriods.reduce(
+      (lastIdx, p, idx) => (p.type !== "trip" ? idx : lastIdx),
+      -1
+    );
 
-    const prevById = new Map();
-    const prevByName = new Map();
+    const knownSchoolIds = new Set();
+    const knownSchoolNames = new Set();
 
-    const allHistoryById = new Map();
-    const allHistoryByName = new Map();
+    // Seneste skoleprofil per elev (til automatisk nedarvning på rejser)
+    const schoolProfileById = new Map();
+    const schoolProfileByName = new Map();
 
-    function getOrCreateTotalHistory(map, key) {
+    // Roomie-historik på tværs af ALLE tidligere perioder (skole + rejser)
+    const recentRoomiesById = new Map();
+    const recentRoomiesByName = new Map();
+    const allRoomiesById = new Map();
+    const allRoomiesByName = new Map();
+
+    // Fysisk skole-historik (værelse, etage, værelsestype) KUN fra skoleperioder
+    const prevSchoolRoomById = new Map();
+    const prevSchoolRoomByName = new Map();
+    const allSchoolRoomsById = new Map();
+    const allSchoolRoomsByName = new Map();
+
+    function addSetItem(map, key, val) {
+      if (!key || !val) return;
+      if (!map.has(key)) map.set(key, new Set());
+      map.get(key).add(val);
+    }
+
+    function getOrCreateRoomHistory(map, key) {
       if (!map.has(key)) {
-        map.set(key, {
-          rooms: new Set(),
-          floors: new Set(),
-          roomTypes: new Set(),
-          roomies: new Set()
-        });
+        map.set(key, { rooms: new Set(), floors: new Set(), roomTypes: new Set() });
       }
       return map.get(key);
     }
 
     priorPeriods.forEach((period, pIdx) => {
+      const isTrip = period.type === "trip";
       const isImmediatePrev = pIdx === priorPeriods.length - 1;
+      // På skoleperioder tæller både sidste skoleperiode og rejser siden da som "nylige roomies"
+      const isRecent = isImmediatePrev || (lastSchoolPeriodIndex !== -1 && pIdx >= lastSchoolPeriodIndex);
+
+      const periodRoomLookup = isTrip
+        ? new Map(mapRawRooms(period.vaerelserRows, mV).map(r => [r.roomId.toLowerCase(), r]))
+        : schoolRoomByLower;
+
       const studentLookup = new Map();
       const studentByName = new Map();
 
@@ -334,15 +391,39 @@
         const idObj = extractStudentIdentity(raw, mE);
         if (!idObj.name) return;
         const key = idObj.extId || `row_${rIdx}_${idObj.name}`;
-        if (idObj.extIdLower) knownIds.add(idObj.extIdLower);
-        if (idObj.nameLower) knownNames.add(idObj.nameLower);
         studentLookup.set(key, idObj);
         studentByName.set(idObj.nameLower, idObj);
+
+        if (!isTrip) {
+          if (idObj.extIdLower) knownSchoolIds.add(idObj.extIdLower);
+          if (idObj.nameLower) knownSchoolNames.add(idObj.nameLower);
+
+          let international = false;
+          let countryName = "";
+          if (mE.country && raw[mE.country]) {
+            countryName = String(raw[mE.country]).trim();
+            const country = countryName.toLowerCase();
+            international = country !== "" && !["dk", "danmark", "denmark"].includes(country);
+          }
+
+          const profile = {
+            countryName,
+            international,
+            optOutInternational: mE.optOutInternational ? isTruthy(raw[mE.optOutInternational]) : false,
+            excludeWith: mE.excludeWith ? splitList(raw[mE.excludeWith]) : [],
+            isNew: mE.isNew && raw[mE.isNew] !== undefined && String(raw[mE.isNew]).trim() !== ""
+              ? isTruthy(raw[mE.isNew])
+              : false
+          };
+
+          if (idObj.extIdLower) schoolProfileById.set(idObj.extIdLower, profile);
+          if (idObj.nameLower) schoolProfileByName.set(idObj.nameLower, profile);
+        }
       });
 
       const roomOccupants = new Map();
       Object.entries(period.assignments || {}).forEach(([roomId, entries]) => {
-        const rObj = roomByLower.get(roomId.toLowerCase());
+        const rObj = periodRoomLookup.get(roomId.toLowerCase());
         const rType = rObj ? rObj.roomType.toLowerCase() : "";
         const floor = rObj ? rObj.floor : getFloorFromRoomId(roomId);
         const occList = [];
@@ -372,27 +453,37 @@
             .filter(other => other !== person)
             .flatMap(other => [other.nameLower, other.extIdLower].filter(Boolean));
 
-          [
-            person.extIdLower ? getOrCreateTotalHistory(allHistoryById, person.extIdLower) : null,
-            person.nameLower ? getOrCreateTotalHistory(allHistoryByName, person.nameLower) : null
-          ]
-            .filter(Boolean)
-            .forEach(rec => {
-              if (person.roomLower) rec.rooms.add(person.roomLower);
-              if (person.floor) rec.floors.add(person.floor);
-              if (person.roomTypeLower) rec.roomTypes.add(person.roomTypeLower);
-              roomies.forEach(rm => rec.roomies.add(rm));
-            });
+          roomies.forEach(rm => {
+            addSetItem(allRoomiesById, person.extIdLower, rm);
+            addSetItem(allRoomiesByName, person.nameLower, rm);
+            if (isRecent) {
+              addSetItem(recentRoomiesById, person.extIdLower, rm);
+              addSetItem(recentRoomiesByName, person.nameLower, rm);
+            }
+          });
 
-          if (isImmediatePrev) {
-            const record = {
-              prevRoom: person.roomLower,
-              prevFloor: person.floor,
-              prevRoomType: person.roomTypeLower,
-              prevRoomies: roomies
-            };
-            if (person.extIdLower) prevById.set(person.extIdLower, record);
-            if (person.nameLower) prevByName.set(person.nameLower, record);
+          // Fysiske værelser, etager og værelsestyper registreres KUN for skoleperioder
+          if (!isTrip) {
+            [
+              person.extIdLower ? getOrCreateRoomHistory(allSchoolRoomsById, person.extIdLower) : null,
+              person.nameLower ? getOrCreateRoomHistory(allSchoolRoomsByName, person.nameLower) : null
+            ]
+              .filter(Boolean)
+              .forEach(rec => {
+                if (person.roomLower) rec.rooms.add(person.roomLower);
+                if (person.floor) rec.floors.add(person.floor);
+                if (person.roomTypeLower) rec.roomTypes.add(person.roomTypeLower);
+              });
+
+            if (pIdx === lastSchoolPeriodIndex) {
+              const roomRec = {
+                prevRoom: person.roomLower,
+                prevFloor: person.floor,
+                prevRoomType: person.roomTypeLower
+              };
+              if (person.extIdLower) prevSchoolRoomById.set(person.extIdLower, roomRec);
+              if (person.nameLower) prevSchoolRoomByName.set(person.nameLower, roomRec);
+            }
           }
         });
       });
@@ -400,48 +491,36 @@
 
     return {
       hasPriorPeriods: priorPeriods.length > 0,
-      hasPriorHistory: allHistoryById.size > 0 || allHistoryByName.size > 0,
-      knownIds,
-      knownNames,
-      prevById,
-      prevByName,
-      allHistoryById,
-      allHistoryByName
+      hasPriorSchoolPeriods: priorSchoolPeriods.length > 0,
+      knownSchoolIds,
+      knownSchoolNames,
+      schoolProfileById,
+      schoolProfileByName,
+      recentRoomiesById,
+      recentRoomiesByName,
+      allRoomiesById,
+      allRoomiesByName,
+      prevSchoolRoomById,
+      prevSchoolRoomByName,
+      allSchoolRoomsById,
+      allSchoolRoomsByName
     };
   }
 
-  // 3. Klargør normaliserede modeller for den aktive periode
+  // 3. Klargør normaliserede modeller for den aktive periode eller rejse
   function buildModels() {
     const state = getState();
     const activePeriod = getActivePeriod();
+    const isTrip = activePeriod.type === "trip";
     const activePeriodIndex = state.periods.findIndex(p => p.id === activePeriod.id);
     const mE = state.mapping.elever;
     const mV = state.mapping.vaerelser;
 
-    const rooms = (state.cachedData.vaerelserRows || [])
-      .map((raw, idx) => {
-        const roomId = String(raw[mV.roomId] || "").trim();
-        const capacity = parseInt(raw[mV.capacity], 10);
-        const activeVal = mV.active ? raw[mV.active] : "";
-        const isActive = !isFalsy(activeVal);
+    const schoolRooms = mapRawRooms(state.cachedData.vaerelserRows, mV);
+    const schoolRoomByLower = new Map(schoolRooms.map(r => [r.roomId.toLowerCase(), r]));
 
-        if (!roomId || isNaN(capacity) || capacity <= 0 || !isActive) return null;
-
-        return {
-          roomId,
-          baseId: getBaseRoomId(roomId),
-          floor: getFloorFromRoomId(roomId),
-          capacity,
-          roomType: mV.roomType ? (raw[mV.roomType] || "").trim() : "",
-          priority: mV.priority ? parsePriority(raw[mV.priority]) : 2,
-          fixedGender: mV.gender ? normalizeGender(raw[mV.gender]) : "Fri",
-          index: idx
-        };
-      })
-      .filter(Boolean);
-
-    const roomByLower = new Map(rooms.map(r => [r.roomId.toLowerCase(), r]));
-    const history = buildMultiPeriodHistory(state, activePeriodIndex, roomByLower, mE);
+    const rooms = isTrip ? mapRawRooms(activePeriod.vaerelserRows, mV) : schoolRooms;
+    const history = buildMultiPeriodHistory(state, activePeriodIndex, schoolRoomByLower, mE, mV);
 
     let returningCount = 0;
     let newStudentsCount = 0;
@@ -453,54 +532,83 @@
 
         const studentKey = idObj.extId || `row_${idx}_${idObj.name}`;
 
+        const schoolProfile =
+          (idObj.extIdLower && history.schoolProfileById.get(idObj.extIdLower)) ||
+          history.schoolProfileByName.get(idObj.nameLower) ||
+          null;
+
         let international = false;
         let countryName = "";
         if (mE.country && raw[mE.country]) {
           countryName = String(raw[mE.country]).trim();
           const country = countryName.toLowerCase();
           international = country !== "" && !["dk", "danmark", "denmark"].includes(country);
+        } else if (isTrip && schoolProfile) {
+          countryName = schoolProfile.countryName;
+          international = schoolProfile.international;
         }
 
-        const histRecord = history.hasPriorPeriods
-          ? (idObj.extIdLower && history.prevById.get(idObj.extIdLower)) ||
-            history.prevByName.get(idObj.nameLower) ||
-            null
-          : null;
-
-        const totalHist = history.hasPriorPeriods
-          ? (idObj.extIdLower && history.allHistoryById.get(idObj.extIdLower)) ||
-            history.allHistoryByName.get(idObj.nameLower) ||
-            null
-          : null;
-
-        const allPrevRooms = totalHist ? [...totalHist.rooms] : [];
-        const allPrevFloors = totalHist ? [...totalHist.floors] : [];
-        const allPrevRoomTypes = totalHist ? [...totalHist.roomTypes] : [];
-        const allPrevRoomies = totalHist ? [...totalHist.roomies] : [];
-
-        const immediateSet = new Set(histRecord ? histRecord.prevRoomies : []);
-        const olderRoomies = allPrevRoomies.filter(r => !immediateSet.has(r));
-
-        const existedBefore =
-          history.hasPriorPeriods &&
+        const existedInSchoolBefore =
+          history.hasPriorSchoolPeriods &&
           Boolean(
-            totalHist ||
-              histRecord ||
-              (idObj.extIdLower && history.knownIds.has(idObj.extIdLower)) ||
-              history.knownNames.has(idObj.nameLower)
+            schoolProfile ||
+              (idObj.extIdLower && history.knownSchoolIds.has(idObj.extIdLower)) ||
+              history.knownSchoolNames.has(idObj.nameLower)
           );
 
         let isNew = false;
         if (mE.isNew && raw[mE.isNew] !== undefined && String(raw[mE.isNew]).trim() !== "") {
           isNew = isTruthy(raw[mE.isNew]);
-        } else if (history.hasPriorPeriods && (history.knownIds.size > 0 || history.knownNames.size > 0)) {
-          isNew = !existedBefore;
+        } else if (isTrip) {
+          // På rejser nedarves "Ny elev"-status fra skolen (gæster/familie uden skoleprofil er ikke nye elever)
+          isNew = schoolProfile ? !!schoolProfile.isNew : false;
+        } else if (history.hasPriorSchoolPeriods && (history.knownSchoolIds.size > 0 || history.knownSchoolNames.size > 0)) {
+          isNew = !existedInSchoolBefore;
         }
 
-        if (history.hasPriorPeriods) {
+        if (!isTrip && history.hasPriorSchoolPeriods) {
           if (isNew) newStudentsCount++;
           else returningCount++;
         }
+
+        // Roomies på tværs af ALLE tidligere perioder (skole + rejser)
+        const recentSet =
+          (idObj.extIdLower && history.recentRoomiesById.get(idObj.extIdLower)) ||
+          history.recentRoomiesByName.get(idObj.nameLower) ||
+          new Set();
+        const allRoomiesSet =
+          (idObj.extIdLower && history.allRoomiesById.get(idObj.extIdLower)) ||
+          history.allRoomiesByName.get(idObj.nameLower) ||
+          new Set();
+
+        const prevRoomies = [...recentSet];
+        const allPrevRoomies = [...allRoomiesSet];
+        const olderRoomies = allPrevRoomies.filter(r => !recentSet.has(r));
+
+        // Fysisk værelse/etage/type bruges KUN på almindelige skoleperioder (ikke på rejser)
+        const prevSchoolRec = !isTrip
+          ? (idObj.extIdLower && history.prevSchoolRoomById.get(idObj.extIdLower)) ||
+            history.prevSchoolRoomByName.get(idObj.nameLower) ||
+            null
+          : null;
+
+        const totalSchoolRec = !isTrip
+          ? (idObj.extIdLower && history.allSchoolRoomsById.get(idObj.extIdLower)) ||
+            history.allSchoolRoomsByName.get(idObj.nameLower) ||
+            null
+          : null;
+
+        const allPrevRooms = totalSchoolRec ? [...totalSchoolRec.rooms] : [];
+        const allPrevFloors = totalSchoolRec ? [...totalSchoolRec.floors] : [];
+        const allPrevRoomTypes = totalSchoolRec ? [...totalSchoolRec.roomTypes] : [];
+
+        // På rejser kombineres evt. "Ikke med" i rejsearket med elevens eksisterende "Ikke med" fra skolen
+        const sheetExcludes = mE.excludeWith ? splitList(raw[mE.excludeWith]) : [];
+        const inheritedExcludes = isTrip && schoolProfile ? schoolProfile.excludeWith : [];
+        const mergedExcludes = [...new Set([...sheetExcludes, ...inheritedExcludes])];
+
+        const sheetOptOut = mE.optOutInternational ? isTruthy(raw[mE.optOutInternational]) : false;
+        const optOutInternational = sheetOptOut || (isTrip && schoolProfile ? schoolProfile.optOutInternational : false);
 
         return {
           key: studentKey,
@@ -511,14 +619,16 @@
           lockedRoom: mE.lockedRoom ? String(raw[mE.lockedRoom] || "").trim() : "",
           countryName,
           international,
-          optOutInternational: mE.optOutInternational ? isTruthy(raw[mE.optOutInternational]) : false,
-          excludeWith: mE.excludeWith ? splitList(raw[mE.excludeWith]) : [],
+          optOutInternational,
+          excludeWith: mergedExcludes,
           isNew,
-          hasPriorPlacement: allPrevRooms.length > 0,
-          prevRoom: histRecord ? histRecord.prevRoom : "",
-          prevFloor: histRecord ? histRecord.prevFloor : "",
-          prevRoomType: histRecord ? histRecord.prevRoomType : "",
-          prevRoomies: histRecord ? histRecord.prevRoomies : [],
+          hasPriorPlacement: isTrip
+            ? allPrevRoomies.length > 0 || existedInSchoolBefore
+            : allPrevRooms.length > 0,
+          prevRoom: prevSchoolRec ? prevSchoolRec.prevRoom : "",
+          prevFloor: prevSchoolRec ? prevSchoolRec.prevFloor : "",
+          prevRoomType: prevSchoolRec ? prevSchoolRec.prevRoomType : "",
+          prevRoomies,
           olderRoomies,
           allPrevRooms,
           allPrevFloors,
@@ -529,18 +639,18 @@
       .filter(Boolean);
 
     let stoppedCount = 0;
-    if (history.hasPriorPeriods) {
+    if (!isTrip && history.hasPriorSchoolPeriods) {
       const currentIds = new Set(students.map(s => s.extId).filter(Boolean));
       const currentNames = new Set(students.map(s => s.nameLower));
-      const totalPrev = history.knownIds.size > 0 ? history.knownIds.size : history.knownNames.size;
+      const totalPrev = history.knownSchoolIds.size > 0 ? history.knownSchoolIds.size : history.knownSchoolNames.size;
       let stillHere = 0;
 
-      if (history.knownIds.size > 0) {
-        history.knownIds.forEach(id => {
+      if (history.knownSchoolIds.size > 0) {
+        history.knownSchoolIds.forEach(id => {
           if (currentIds.has(id)) stillHere++;
         });
       } else {
-        history.knownNames.forEach(n => {
+        history.knownSchoolNames.forEach(n => {
           if (currentNames.has(n)) stillHere++;
         });
       }
@@ -552,8 +662,8 @@
       students,
       activePeriod,
       meta: {
-        isSubsequentPeriod: history.hasPriorPeriods,
-        hasPriorHistory: history.hasPriorHistory,
+        isTrip,
+        isSubsequentPeriod: isTrip ? history.hasPriorPeriods : history.hasPriorSchoolPeriods,
         returningCount,
         newStudentsCount,
         stoppedCount
@@ -598,14 +708,20 @@
     return students.filter(s => !placedSet.has(s.key));
   }
 
-  // 4. Hent data fra Google Sheets for fælles værelsesliste + aktiv periode
+  // 4. Hent data fra Google Sheets for aktiv periode eller rejse
   async function fetchSheetsData() {
     const state = getState();
     const activePeriod = getActivePeriod();
+    const isTrip = activePeriod.type === "trip";
     const statusEl = document.getElementById("status-bar");
 
-    if (!state.urlVaerelser || !activePeriod.urlElever) {
-      statusEl.innerHTML = `⚠️ Indtast link til både <strong>Fælles Værelsesliste</strong> og <strong>Elevliste for "${escapeHtml(activePeriod.name)}"</strong> under Indstillinger.`;
+    const roomsUrl = isTrip ? activePeriod.urlVaerelser : state.urlVaerelser;
+    const eleverUrl = activePeriod.urlElever;
+
+    if (!roomsUrl || !eleverUrl) {
+      statusEl.innerHTML = isTrip
+        ? `⚠️ Indtast link til både <strong>Rejsens Værelsesliste</strong> og <strong>Deltagerliste for "${escapeHtml(activePeriod.name)}"</strong> under Indstillinger.`
+        : `⚠️ Indtast link til både <strong>Skolens Fælles Værelsesliste</strong> og <strong>Elevliste for "${escapeHtml(activePeriod.name)}"</strong> under Indstillinger.`;
       document.getElementById("settings-panel").classList.remove("hidden");
       return;
     }
@@ -614,8 +730,8 @@
 
     try {
       const [resV, resE] = await Promise.all([
-        fetch(state.urlVaerelser, { cache: "no-store" }),
-        fetch(activePeriod.urlElever, { cache: "no-store" })
+        fetch(roomsUrl, { cache: "no-store" }),
+        fetch(eleverUrl, { cache: "no-store" })
       ]);
 
       if (!resV.ok || !resE.ok) {
@@ -630,7 +746,11 @@
         list => list && list.length > 0
       );
 
-      state.cachedData.vaerelserRows = parsedV.rows;
+      if (isTrip) {
+        activePeriod.vaerelserRows = parsedV.rows;
+      } else {
+        state.cachedData.vaerelserRows = parsedV.rows;
+      }
       activePeriod.eleverRows = parsedE.rows;
 
       autoMapHeaders(parsedE.headers, parsedV.headers);
@@ -648,7 +768,7 @@
       }
 
       const syncSummary = syncAssignmentsWithModels(true);
-      const { meta } = buildModels();
+      const { rooms, students, meta } = buildModels();
 
       if (hadExistingAssignments && syncSummary.preservedCount > 0) {
         const unplacedText =
@@ -656,10 +776,12 @@
             ? `, <strong>${syncSummary.unplacedCount}</strong> uden værelse`
             : "";
         statusEl.innerHTML = `✅ Data opdateret for <strong>${escapeHtml(activePeriod.name)}</strong>! Eksisterende fordeling er bevaret (<strong>${syncSummary.placedCount}</strong> placeret${unplacedText}).`;
+      } else if (isTrip) {
+        statusEl.innerHTML = `✈️ <strong>${escapeHtml(activePeriod.name)}:</strong> Indlæst <strong>${students.length}</strong> deltagere og <strong>${rooms.length}</strong> rejseværelser.`;
       } else if (meta.isSubsequentPeriod) {
         statusEl.innerHTML = `✅ <strong>${escapeHtml(activePeriod.name)}:</strong> ${meta.returningCount} fortsættende elever, <strong>${meta.newStudentsCount}</strong> nye elever${meta.stoppedCount > 0 ? `, ${meta.stoppedCount} stoppede frasorteret` : ""}.`;
       } else {
-        statusEl.innerHTML = `✅ <strong>${escapeHtml(activePeriod.name)}:</strong> Indlæst <strong>${activePeriod.eleverRows.length}</strong> elever og <strong>${state.cachedData.vaerelserRows.length}</strong> værelser.`;
+        statusEl.innerHTML = `✅ <strong>${escapeHtml(activePeriod.name)}:</strong> Indlæst <strong>${activePeriod.eleverRows.length}</strong> elever og <strong>${rooms.length}</strong> værelser.`;
       }
     } catch (err) {
       statusEl.innerHTML = `❌ <strong>Fejl:</strong> ${escapeHtml(err.message)}`;
@@ -744,9 +866,10 @@
     };
   }
 
-  // 5. Tilfældig fordelingsalgoritme for den aktive periode
+  // 5. Tilfældig fordelingsalgoritme for aktiv periode eller rejse
   function allocateRemainingRandomly() {
-    const { rooms, students, activePeriod } = buildModels();
+    const { rooms, students, activePeriod, meta } = buildModels();
+    const isTrip = meta.isTrip;
     const state = getState();
     const rules = state.rules;
     const warnings = [];
@@ -781,6 +904,9 @@
     const unlockedStudents = students.filter(s => !lockedKeys.has(s.key));
 
     function canPlaceInRoom(student, room, currentRooms, ignoreStudentKey = null) {
+      // På rejser placerer algoritmen aldrig tilfældige elever ind i værelser med forhåndslåste familier/grupper
+      if (isTrip && lockedByRoom[room.roomId].length > 0) return false;
+
       const occupants = currentRooms[room.roomId].filter(s => s.key !== ignoreStudentKey);
       if (occupants.length >= room.capacity) return false;
 
@@ -825,7 +951,9 @@
         const prio = Number.isFinite(room.priority) ? room.priority : 2;
         totalScore -= prio * 200 * count;
 
-        if (room.capacity > 1 && count === 1) {
+        // Et forhåndslåst familieværelse på en rejse straffes ikke som en "ensom" elev
+        const isLockedOnlyTripRoom = isTrip && lockedByRoom[room.roomId].length === count;
+        if (!isLockedOnlyTripRoom && room.capacity > 1 && count === 1) {
           lonelyMultiRooms++;
           totalScore -= 5000;
         }
@@ -842,27 +970,29 @@
 
         for (let i = 0; i < count; i++) {
           const s1 = occs[i];
-          const rLower = room.roomId.toLowerCase();
-          if (s1.prevRoom && rLower === s1.prevRoom) {
-            totalScore -= 60;
-          } else if (s1.allPrevRooms.includes(rLower)) {
-            totalScore -= 35;
-          }
-
-          if (room.floor) {
-            if (s1.prevFloor && room.floor === s1.prevFloor) {
-              totalScore -= 30;
-            } else if (s1.allPrevFloors.includes(room.floor)) {
-              totalScore -= 15;
+          if (!isTrip) {
+            const rLower = room.roomId.toLowerCase();
+            if (s1.prevRoom && rLower === s1.prevRoom) {
+              totalScore -= 60;
+            } else if (s1.allPrevRooms.includes(rLower)) {
+              totalScore -= 35;
             }
-          }
 
-          if (room.roomType) {
-            const rtLower = room.roomType.toLowerCase();
-            if (s1.prevRoomType && rtLower === s1.prevRoomType) {
-              totalScore -= 25;
-            } else if (s1.allPrevRoomTypes.includes(rtLower)) {
-              totalScore -= 12;
+            if (room.floor) {
+              if (s1.prevFloor && room.floor === s1.prevFloor) {
+                totalScore -= 30;
+              } else if (s1.allPrevFloors.includes(room.floor)) {
+                totalScore -= 15;
+              }
+            }
+
+            if (room.roomType) {
+              const rtLower = room.roomType.toLowerCase();
+              if (s1.prevRoomType && rtLower === s1.prevRoomType) {
+                totalScore -= 25;
+              } else if (s1.allPrevRoomTypes.includes(rtLower)) {
+                totalScore -= 12;
+              }
             }
           }
 
@@ -1012,19 +1142,21 @@
             }
           }
 
-          const rLower = room.roomId.toLowerCase();
-          if (student.prevRoom && rLower === student.prevRoom) stepScore -= 60;
-          else if (student.allPrevRooms.includes(rLower)) stepScore -= 35;
+          if (!isTrip) {
+            const rLower = room.roomId.toLowerCase();
+            if (student.prevRoom && rLower === student.prevRoom) stepScore -= 60;
+            else if (student.allPrevRooms.includes(rLower)) stepScore -= 35;
 
-          if (room.floor) {
-            if (student.prevFloor && room.floor === student.prevFloor) stepScore -= 30;
-            else if (student.allPrevFloors.includes(room.floor)) stepScore -= 15;
-          }
+            if (room.floor) {
+              if (student.prevFloor && room.floor === student.prevFloor) stepScore -= 30;
+              else if (student.allPrevFloors.includes(room.floor)) stepScore -= 15;
+            }
 
-          if (room.roomType) {
-            const rtLower = room.roomType.toLowerCase();
-            if (student.prevRoomType && rtLower === student.prevRoomType) stepScore -= 25;
-            else if (student.allPrevRoomTypes.includes(rtLower)) stepScore -= 12;
+            if (room.roomType) {
+              const rtLower = room.roomType.toLowerCase();
+              if (student.prevRoomType && rtLower === student.prevRoomType) stepScore -= 25;
+              else if (student.allPrevRoomTypes.includes(rtLower)) stepScore -= 12;
+            }
           }
 
           const sharedImmediatePrev = occupants.some(occ =>
@@ -1102,7 +1234,7 @@
     document.getElementById("status-bar").innerHTML = `🧹 Ryddede <strong>${clearedCount}</strong> ulåste elever i <strong>${escapeHtml(activePeriod.name)}</strong>. Låste elever blev på deres pladser.`;
   }
 
-  // 6. Modaler (valg af elev på sengeplads + oprettelse af nyt værelsesskift)
+  // 6. Modaler (valg af elev på sengeplads + oprettelse af nyt værelsesskift eller rejse)
   function openBedPicker(roomId) {
     activePickerRoomId = roomId;
     const modal = document.getElementById("bed-picker-modal");
@@ -1203,12 +1335,45 @@
       .join("");
   }
 
-  function openNewPeriodModal() {
+  function syncNewPeriodModalType() {
     const state = getState();
-    const activePeriod = getActivePeriod();
-    const nextNum = state.periods.length;
-    document.getElementById("new-period-name").value = `Værelsesskift ${nextNum}`;
-    document.getElementById("new-period-elever-url").value = activePeriod.urlElever || "";
+    const selectedType = document.querySelector('input[name="new-period-type"]:checked')?.value || "school";
+    const isTrip = selectedType === "trip";
+
+    const roomsUrlGroup = document.getElementById("new-period-rooms-url-group");
+    const nameLabel = document.getElementById("new-period-name-label");
+    const nameInput = document.getElementById("new-period-name");
+    const eleverLabel = document.getElementById("new-period-elever-label");
+    const eleverInput = document.getElementById("new-period-elever-url");
+    const eleverHint = document.getElementById("new-period-elever-hint");
+
+    roomsUrlGroup.classList.toggle("hidden", !isTrip);
+
+    if (isTrip) {
+      const nextTripNum = state.periods.filter(p => p.type === "trip").length + 1;
+      nameLabel.textContent = "Navn på rejse";
+      nameInput.placeholder = "F.eks. La Santa eller Studietur";
+      nameInput.value = `Rejse ${nextTripNum}`;
+      eleverLabel.textContent = "CSV-link til deltagerliste *";
+      eleverInput.value = "";
+      eleverHint.textContent = "Indsæt linket til deltagerne på rejsen. Begrænsninger ('Ikke med') og historik hentes automatisk fra skolen.";
+    } else {
+      const nextSchoolNum = state.periods.filter(p => p.type !== "trip").length;
+      const latestSchool = [...state.periods].reverse().find(p => p.type !== "trip") || getActivePeriod();
+      nameLabel.textContent = "Navn på værelsesskift";
+      nameInput.placeholder = "F.eks. Værelsesskift 1";
+      nameInput.value = `Værelsesskift ${nextSchoolNum}`;
+      eleverLabel.textContent = "CSV-link til den nye elevliste *";
+      eleverInput.value = latestSchool.urlElever || "";
+      eleverHint.textContent = "Indsæt linket til den friske systemeksport (eller behold samme link, hvis du har overskrevet arket). Nye elever opdages automatisk.";
+    }
+  }
+
+  function openNewPeriodModal() {
+    const schoolRadio = document.querySelector('input[name="new-period-type"][value="school"]');
+    if (schoolRadio) schoolRadio.checked = true;
+    document.getElementById("new-period-rooms-url").value = "";
+    syncNewPeriodModalType();
     document.getElementById("new-period-modal").classList.remove("hidden");
     setTimeout(() => document.getElementById("new-period-name").focus(), 20);
   }
@@ -1217,7 +1382,7 @@
     document.getElementById("new-period-modal").classList.add("hidden");
   }
 
-  // 7. Rendering af periode-faner, optælling, værelsesskift-status, pulje uden værelse, værelseskort og tabel
+  // 7. Rendering af periode-faner, optælling, værelsesskift-/rejsestatus, pulje uden værelse, værelseskort og tabel
   function renderPeriodsBar() {
     const state = getState();
     const bar = document.getElementById("periods-bar");
@@ -1226,13 +1391,14 @@
     const tabsHtml = state.periods
       .map(p => {
         const isActive = p.id === state.activePeriodId;
+        const isTrip = p.type === "trip";
         const placedCount = Object.values(p.assignments || {}).reduce((sum, list) => sum + (list ? list.length : 0), 0);
         const totalInPeriod = (p.eleverRows || []).length;
         const badgeText = totalInPeriod > 0 ? `${placedCount}/${totalInPeriod}` : "Ny";
 
         return `
-          <button type="button" class="period-tab ${isActive ? "active" : ""}" data-switch-period="${escapeHtml(p.id)}">
-            <span>${escapeHtml(p.name)}</span>
+          <button type="button" class="period-tab ${isTrip ? "is-trip" : ""} ${isActive ? "active" : ""}" data-switch-period="${escapeHtml(p.id)}">
+            <span>${isTrip ? "✈️ " : ""}${escapeHtml(p.name)}</span>
             <span class="tab-count">${badgeText}</span>
           </button>
         `;
@@ -1241,7 +1407,7 @@
 
     bar.innerHTML = `
       ${tabsHtml}
-      <button type="button" id="btn-open-new-period" class="period-add-btn">+ Nyt værelsesskift</button>
+      <button type="button" id="btn-open-new-period" class="period-add-btn">+ Ny periode / rejse</button>
     `;
   }
 
@@ -1256,6 +1422,7 @@
     }
 
     panel.classList.remove("hidden");
+    const isTrip = meta.isTrip;
 
     let evaluatedCount = 0;
     let newRoomiesCount = 0;
@@ -1311,28 +1478,30 @@
           reasons.push(`Tidligere roomie (${repeatedRoomies.join(", ")})`);
         }
 
-        if (room.floor && s.allPrevFloors.length > 0) {
-          floorComparableCount++;
-          if (!s.allPrevFloors.includes(room.floor)) {
-            newFloorCount++;
-          } else {
-            reasons.push(`Samme etage (Etage ${room.floor})`);
+        if (!isTrip) {
+          if (room.floor && s.allPrevFloors.length > 0) {
+            floorComparableCount++;
+            if (!s.allPrevFloors.includes(room.floor)) {
+              newFloorCount++;
+            } else {
+              reasons.push(`Samme etage (Etage ${room.floor})`);
+            }
           }
-        }
 
-        if (room.roomType && s.allPrevRoomTypes.length > 0) {
-          typeComparableCount++;
-          if (!s.allPrevRoomTypes.includes(room.roomType.toLowerCase())) {
-            newTypeCount++;
-          } else {
-            reasons.push(`Samme værelsestype (${room.roomType})`);
+          if (room.roomType && s.allPrevRoomTypes.length > 0) {
+            typeComparableCount++;
+            if (!s.allPrevRoomTypes.includes(room.roomType.toLowerCase())) {
+              newTypeCount++;
+            } else {
+              reasons.push(`Samme værelsestype (${room.roomType})`);
+            }
           }
-        }
 
-        if (!s.allPrevRooms.includes(room.roomId.toLowerCase())) {
-          newRoomCount++;
-        } else {
-          reasons.push(`Samme værelse (${room.roomId})`);
+          if (!s.allPrevRooms.includes(room.roomId.toLowerCase())) {
+            newRoomCount++;
+          } else {
+            reasons.push(`Samme værelse (${room.roomId})`);
+          }
         }
 
         if (reasons.length > 0) {
@@ -1348,10 +1517,10 @@
     if (evaluatedCount === 0 && placedNewCount === 0) {
       panel.innerHTML = `
         <div class="shift-status-header">
-          <h2>🔄 Status på værelsesskift – ${escapeHtml(activePeriod.name)}</h2>
+          <h2>${isTrip ? "✈️ Status på rejse" : "🔄 Status på værelsesskift"} – ${escapeHtml(activePeriod.name)}</h2>
           <span class="room-meta">Afventer placering af elever</span>
         </div>
-        <p class="hint" style="margin:0;">Klik på <strong>🎲 Fordel ulåste</strong> for at se, hvor mange der kommer på ny etage, ny værelsestype og med nye roomies.</p>
+        <p class="hint" style="margin:0;">Klik på <strong>🎲 Fordel ulåste</strong> for at se status i forhold til tidligere værelseskonstellationer.</p>
       `;
       return;
     }
@@ -1394,9 +1563,21 @@
           )
         : "";
 
+    const schoolOnlyCards = !isTrip
+      ? `
+        ${buildMetricCard("Ny etage", newFloorCount, floorComparableCount, `${newFloorCount} af ${floorComparableCount} fortsættende elever`, "Ingen etage i værelsesnr.")}
+        ${buildMetricCard("Ny værelsestype", newTypeCount, typeComparableCount, `${newTypeCount} af ${typeComparableCount} fortsættende elever`, "Ingen værelsestype angivet")}
+        ${buildMetricCard("Nyt værelse", newRoomCount, evaluatedCount, `${newRoomCount} af ${evaluatedCount} fortsættende elever`, "Ingen historik")}
+      `
+      : "";
+
+    const allGoodText = isTrip
+      ? `✓ Alle ${evaluatedCount} placerede deltagere bor med helt nye roomies i forhold til tidligere perioder.`
+      : `✓ Alle ${evaluatedCount} fortsættende elever har fået nye roomies, ny etage, ny værelsestype og nyt værelse${placedNewCount > 0 ? `, og alle ${placedNewCount} nye elever er spredt` : ""}.`;
+
     const deviationsHtml =
       deviations.length === 0
-        ? `<div class="shift-all-good">✓ Alle ${evaluatedCount} fortsættende elever har fået nye roomies, ny etage, ny værelsestype og nyt værelse${placedNewCount > 0 ? `, og alle ${placedNewCount} nye elever er spredt` : ""}.</div>`
+        ? `<div class="shift-all-good">${allGoodText}</div>`
         : `<details class="shift-deviations">
             <summary>⚠️ ${deviations.length} elev(er) har én eller flere gentagelser (klik for at se hvem)</summary>
             <ul>
@@ -1411,15 +1592,13 @@
 
     panel.innerHTML = `
       <div class="shift-status-header">
-        <h2>🔄 Status på værelsesskift – ${escapeHtml(activePeriod.name)}</h2>
-        <span class="room-meta">Sammenlignet med alle tidligere perioder (${evaluatedCount} fortsættende${placedNewCount > 0 ? ` · ${placedNewCount} nye` : ""})</span>
+        <h2>${isTrip ? "✈️ Status på rejse" : "🔄 Status på værelsesskift"} – ${escapeHtml(activePeriod.name)}</h2>
+        <span class="room-meta">Sammenlignet med alle tidligere perioder (${evaluatedCount} ${isTrip ? "deltagere" : "fortsættende"}${placedNewCount > 0 ? ` · ${placedNewCount} nye` : ""})</span>
       </div>
       <div class="shift-metrics-grid">
-        ${buildMetricCard("Nye roomies", newRoomiesCount, evaluatedCount, `${newRoomiesCount} af ${evaluatedCount} fortsættende elever`, "Ingen historik")}
+        ${buildMetricCard("Nye roomies", newRoomiesCount, evaluatedCount, `${newRoomiesCount} af ${evaluatedCount} ${isTrip ? "deltagere" : "fortsættende elever"}`, "Ingen historik")}
         ${newSpreadCard}
-        ${buildMetricCard("Ny etage", newFloorCount, floorComparableCount, `${newFloorCount} af ${floorComparableCount} fortsættende elever`, "Ingen etage i værelsesnr.")}
-        ${buildMetricCard("Ny værelsestype", newTypeCount, typeComparableCount, `${newTypeCount} af ${typeComparableCount} fortsættende elever`, "Ingen værelsestype angivet")}
-        ${buildMetricCard("Nyt værelse", newRoomCount, evaluatedCount, `${newRoomCount} af ${evaluatedCount} fortsættende elever`, "Ingen historik")}
+        ${schoolOnlyCards}
       </div>
       ${deviationsHtml}
     `;
@@ -1433,19 +1612,20 @@
     const assignments = activePeriod.assignments || {};
     const studentMap = new Map(students.map(s => [s.key, s]));
 
-    // Tjek alle konflikter (Ikke med, fravalg af international, blandede køn)
     const {
       roomConflicts,
       clusterConflicts,
       conflictingStudentKeys,
       topWarnings
-    } = analyzeRoomConflicts(rooms, assignments, studentMap, state.rules);
+    } = analyzeRoomConflicts(rooms, assignments, studentMap, state.rules, meta.isTrip);
 
     const activeWarnings = [...topWarnings, ...warnings];
 
     const sectionTitleEl = document.getElementById("rooms-section-title");
     if (sectionTitleEl) {
-      sectionTitleEl.textContent = `Værelsesoversigt – ${activePeriod.name}`;
+      sectionTitleEl.textContent = meta.isTrip
+        ? `✈️ Værelsesoversigt – ${activePeriod.name}`
+        : `Værelsesoversigt – ${activePeriod.name}`;
     }
 
     const totalRooms = rooms.length;
@@ -1479,7 +1659,7 @@
 
     if (students.length > totalBeds) {
       activeWarnings.unshift(
-        `Der er <strong>${students.length}</strong> elever, men kun <strong>${totalBeds}</strong> aktive sengepladser (mangler <strong>${students.length - totalBeds}</strong> pladser).`
+        `Der er <strong>${students.length}</strong> ${meta.isTrip ? "deltagere" : "elever"}, men kun <strong>${totalBeds}</strong> aktive sengepladser (mangler <strong>${students.length - totalBeds}</strong> pladser).`
       );
     }
 
@@ -1508,9 +1688,9 @@
             <div class="stat-sub">${totalBeds > 0 ? Math.round((occupiedBeds / totalBeds) * 100) : 0}% belægning</div>
           </div>
           <div class="stat-card ${capacityAlert ? "stat-danger" : allPlaced ? "stat-success" : ""}">
-            <div class="stat-label">Elever i ${escapeHtml(activePeriod.name)}</div>
+            <div class="stat-label">${meta.isTrip ? "Deltagere på" : "Elever i"} ${escapeHtml(activePeriod.name)}</div>
             <div class="stat-value">${students.length}</div>
-            <div class="stat-sub">${allPlaced ? "✓ Alle elever har fået plads" : `${unplacedCount} uden værelse`}</div>
+            <div class="stat-sub">${allPlaced ? "✓ Alle har fået plads" : `${unplacedCount} uden værelse`}</div>
           </div>
         `;
       }
@@ -1572,10 +1752,13 @@
     rooms.forEach(room => {
       const assigned = assignments[room.roomId] || [];
       const occupants = assigned.map(a => studentMap.get(a.studentKey)).filter(Boolean);
+      const genders = [...new Set(occupants.map(o => o.gender).filter(g => g !== "Fri"))];
       if (room.fixedGender !== "Fri") {
         clusterGenderMap[room.baseId] = room.fixedGender;
-      } else if (!clusterGenderMap[room.baseId] && occupants[0]?.gender && occupants[0].gender !== "Fri") {
-        clusterGenderMap[room.baseId] = occupants[0].gender;
+      } else if (!clusterGenderMap[room.baseId] && genders.length > 1) {
+        clusterGenderMap[room.baseId] = "Familie / Blandet";
+      } else if (!clusterGenderMap[room.baseId] && genders.length === 1) {
+        clusterGenderMap[room.baseId] = genders[0];
       }
     });
 
@@ -1820,7 +2003,8 @@
         setActivePeriod(periodId);
         renderSettingsUI();
         const activePeriod = getActivePeriod();
-        document.getElementById("status-bar").innerHTML = `📂 Viser <strong>${escapeHtml(activePeriod.name)}</strong>.`;
+        const icon = activePeriod.type === "trip" ? "✈️" : "📂";
+        document.getElementById("status-bar").innerHTML = `${icon} Viser <strong>${escapeHtml(activePeriod.name)}</strong>.`;
         renderAll();
         return;
       }
@@ -1830,21 +2014,33 @@
       }
     });
 
+    // Skift mellem Værelsesskift og Rejse i modalen
+    document.querySelectorAll('input[name="new-period-type"]').forEach(radio => {
+      radio.addEventListener("change", syncNewPeriodModalType);
+    });
+
     document.getElementById("btn-close-new-period").addEventListener("click", closeNewPeriodModal);
     document.getElementById("btn-cancel-new-period").addEventListener("click", closeNewPeriodModal);
     document.getElementById("new-period-modal").addEventListener("click", e => {
       if (e.target.id === "new-period-modal") closeNewPeriodModal();
     });
     document.getElementById("btn-confirm-new-period").addEventListener("click", () => {
+      const selectedType = document.querySelector('input[name="new-period-type"]:checked')?.value || "school";
+      const isTrip = selectedType === "trip";
       const name = document.getElementById("new-period-name").value.trim();
+      const roomsUrl = document.getElementById("new-period-rooms-url").value.trim();
       const eleverUrl = document.getElementById("new-period-elever-url").value.trim();
 
+      if (isTrip && !roomsUrl) {
+        alert("Indtast venligst et CSV-link til rejsens værelsesliste.");
+        return;
+      }
       if (!eleverUrl) {
-        alert("Indtast venligst et CSV-link til elevlisten for det nye værelsesskift.");
+        alert(isTrip ? "Indtast venligst et CSV-link til deltagerlisten." : "Indtast venligst et CSV-link til elevlisten.");
         return;
       }
 
-      addPeriod(name, eleverUrl);
+      addPeriod(name, eleverUrl, { type: selectedType, urlVaerelser: roomsUrl });
       closeNewPeriodModal();
       renderSettingsUI();
       fetchSheetsData();
@@ -1872,7 +2068,7 @@
     });
 
     document.getElementById("btn-reset-storage").addEventListener("click", () => {
-      if (!confirm("Dette nulstiller alle perioder og gemte fordelinger. Vil du fortsætte?")) return;
+      if (!confirm("Dette nulstiller alle perioder, rejser og gemte fordelinger. Vil du fortsætte?")) return;
       resetState();
       renderSettingsUI();
       renderAll();
@@ -2033,8 +2229,15 @@
 
     const state = getState();
     const activePeriod = getActivePeriod();
-    if ((activePeriod.eleverRows || []).length > 0 && (state.cachedData.vaerelserRows || []).length > 0) {
-      document.getElementById("status-bar").innerHTML = `💾 Gendannet <strong>${escapeHtml(activePeriod.name)}</strong> (${activePeriod.eleverRows.length} elever og ${state.cachedData.vaerelserRows.length} værelser) fra localStorage.`;
+    const hasRooms = activePeriod.type === "trip"
+      ? (activePeriod.vaerelserRows || []).length > 0
+      : (state.cachedData.vaerelserRows || []).length > 0;
+
+    if ((activePeriod.eleverRows || []).length > 0 && hasRooms) {
+      const roomCount = activePeriod.type === "trip"
+        ? activePeriod.vaerelserRows.length
+        : state.cachedData.vaerelserRows.length;
+      document.getElementById("status-bar").innerHTML = `💾 Gendannet <strong>${escapeHtml(activePeriod.name)}</strong> (${activePeriod.eleverRows.length} elever og ${roomCount} værelser) fra localStorage.`;
       renderAll();
     } else {
       fetchSheetsData();

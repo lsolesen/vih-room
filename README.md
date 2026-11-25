@@ -82,3 +82,11 @@ Appen sammenligner med **samtlige** tidligere periode-faner, men vægter den **u
 ## 5. Noter til fremtidige ændringer *(udfyld her hvis du vil ændre reglerne)*
 
 - [ ] ...
+
+
+---
+
+## 6. Ideer til forbedringer
+
+- Grønlandske elever på tre mands værelser
+- Drenge over 23 år prioriteres at bo sammen

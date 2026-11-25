@@ -7,12 +7,15 @@ window.RoomSettings = (function () {
   const DEFAULT_VAERELSER_URL =
     "https://docs.google.com/spreadsheets/d/e/2PACX-1vRk2Tks0XVu1h_y3lh4w6YQAfxsMq6f9HSNe5xR27c-DpvKh90P4CH1CmE2Fu16-6e4289l3VcnDIMy/pub?gid=0&single=true&output=csv";
 
-  function createPeriodObject(id, name, urlElever = "") {
+  function createPeriodObject(id, name, urlElever = "", options = {}) {
     return {
       id,
+      type: options.type === "trip" ? "trip" : "school", // "school" | "trip"
       name,
       urlElever,
+      urlVaerelser: options.urlVaerelser || "",
       eleverRows: [],
+      vaerelserRows: [], // Bruges kun når type === "trip"
       assignments: {} // { roomId: [ { studentKey, locked } ] }
     };
   }
@@ -34,7 +37,7 @@ window.RoomSettings = (function () {
       vaerelserRows: []
     },
     activePeriodId: "period_1",
-    periods: [createPeriodObject("period_1", "Periode 1", DEFAULT_ELEVER_URL)]
+    periods: [createPeriodObject("period_1", "Periode 1", DEFAULT_ELEVER_URL, { type: "school" })]
   };
 
   // Synonymer til automatisk genkendelse af kolonner fra systemeksport
@@ -68,7 +71,12 @@ window.RoomSettings = (function () {
       if (rawV3) {
         const parsed = JSON.parse(rawV3);
         const periods = Array.isArray(parsed.periods) && parsed.periods.length > 0
-          ? parsed.periods
+          ? parsed.periods.map(p => ({
+              type: p.type === "trip" ? "trip" : "school",
+              urlVaerelser: p.urlVaerelser || "",
+              vaerelserRows: Array.isArray(p.vaerelserRows) ? p.vaerelserRows : [],
+              ...p
+            }))
           : structuredClone(DEFAULT_CONFIG.periods);
 
         return {
@@ -94,7 +102,8 @@ window.RoomSettings = (function () {
         const p1 = createPeriodObject(
           "period_1",
           "Periode 1",
-          old.urlElever1 || old.urlElever || DEFAULT_ELEVER_URL
+          old.urlElever1 || old.urlElever || DEFAULT_ELEVER_URL,
+          { type: "school" }
         );
         p1.eleverRows = old.cachedData?.elever1Rows || old.cachedData?.eleverRows || [];
         p1.assignments = old.cachedData?.assignments || {};
@@ -154,10 +163,17 @@ window.RoomSettings = (function () {
     }
   }
 
-  function addPeriod(name, urlElever) {
+  function addPeriod(name, urlElever, options = {}) {
     const id = `period_${Date.now()}`;
-    const cleanName = (name || "").trim() || `Værelsesskift ${state.periods.length}`;
-    const newPeriod = createPeriodObject(id, cleanName, urlElever.trim());
+    const isTrip = options.type === "trip";
+    const defaultName = isTrip
+      ? `Rejse ${state.periods.filter(p => p.type === "trip").length + 1}`
+      : `Værelsesskift ${state.periods.filter(p => p.type !== "trip").length}`;
+    const cleanName = (name || "").trim() || defaultName;
+    const newPeriod = createPeriodObject(id, cleanName, urlElever.trim(), {
+      type: isTrip ? "trip" : "school",
+      urlVaerelser: (options.urlVaerelser || "").trim()
+    });
     state.periods.push(newPeriod);
     state.activePeriodId = id;
     saveState();
@@ -215,15 +231,33 @@ window.RoomSettings = (function () {
 
   function renderSettingsUI() {
     const activePeriod = getActivePeriod();
+    const isTrip = activePeriod.type === "trip";
+
     document.getElementById("url-vaerelser").value = state.urlVaerelser || "";
-    document.getElementById("active-period-settings-title").textContent = `Opsætning for "${activePeriod.name}"`;
+    document.getElementById("active-period-settings-title").textContent = isTrip
+      ? `Opsætning for rejse "${activePeriod.name}"`
+      : `Opsætning for "${activePeriod.name}"`;
+
+    document.getElementById("period-name-label").textContent = isTrip
+      ? "Navn på rejse"
+      : "Navn på periode / værelsesskift";
     document.getElementById("period-name-input").value = activePeriod.name || "";
+
+    const tripRoomGroup = document.getElementById("trip-room-url-group");
+    if (tripRoomGroup) {
+      tripRoomGroup.classList.toggle("hidden", !isTrip);
+      document.getElementById("url-period-vaerelser").value = activePeriod.urlVaerelser || "";
+    }
+
+    document.getElementById("period-elever-label").textContent = isTrip
+      ? "Deltagerliste for rejsen (CSV-link)"
+      : "Elevliste for denne periode (CSV-link)";
     document.getElementById("url-period-elever").value = activePeriod.urlElever || "";
 
     const deleteBtn = document.getElementById("btn-delete-period");
     if (deleteBtn) {
       deleteBtn.disabled = state.periods.length <= 1;
-      deleteBtn.title = state.periods.length <= 1 ? "Du kan ikke slette den sidste periode" : "Slet denne periode";
+      deleteBtn.title = state.periods.length <= 1 ? "Du kan ikke slette den sidste periode" : "Slet denne fane";
     }
 
     document.getElementById("rule-ab-strict-internat").checked = !!state.rules.abStrictInternat;
@@ -269,6 +303,10 @@ window.RoomSettings = (function () {
     const newName = document.getElementById("period-name-input").value.trim();
     if (newName) activePeriod.name = newName;
     activePeriod.urlElever = document.getElementById("url-period-elever").value.trim();
+
+    if (activePeriod.type === "trip") {
+      activePeriod.urlVaerelser = document.getElementById("url-period-vaerelser").value.trim();
+    }
 
     state.rules.abStrictInternat = document.getElementById("rule-ab-strict-internat").checked;
     state.rules.abStrictExclude = document.getElementById("rule-ab-strict-exclude").checked;
